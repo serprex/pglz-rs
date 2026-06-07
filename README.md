@@ -11,16 +11,20 @@ let roundtrip = decompress(&compressed).unwrap();
 assert_eq!(roundtrip, data);
 ```
 
-Caller-owned buffers:
+Caller-owned buffers and capacity hints:
 
 ```rust
-use pglz::{compress_into, decompress_into, max_compressed_buffer_size, Strategy};
+use pglz::{
+    compress_into, decompress_into, decompress_with_capacity, max_compressed_buffer_size, Strategy,
+};
 
 let mut buf = vec![0u8; max_compressed_buffer_size(data.len())];
 let n = compress_into(data, &mut buf, &Strategy::DEFAULT).unwrap();
 
 let mut out = vec![0u8; data.len()];
 decompress_into(&buf[..n], &mut out, true).unwrap();
+
+let out = decompress_with_capacity(&buf[..n], data.len()).unwrap();
 ```
 
 ## Strategy
@@ -43,3 +47,9 @@ tokio_io::decompress(&mut reader, &mut writer).await?;
 ```
 
 Whole input is buffered in memory; pglz needs random access to find back-references.
+
+## Benchmark
+
+```sh
+cargo run --release --example decompress_bench
+```

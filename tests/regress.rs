@@ -4,7 +4,7 @@
 //! the `always` strategy and `pglz_decompress` with the rawsize/check_complete
 //! parameters.
 
-use pglz::{Strategy, compress, decompress, decompress_into};
+use pglz::{Strategy, compress, decompress, decompress_into, decompress_with_capacity};
 
 fn abcd_400() -> Vec<u8> {
     "abcd".repeat(100).into_bytes()
@@ -15,6 +15,14 @@ fn roundtrip_via_decompress() {
     let input = abcd_400();
     let compressed = compress(&input, &Strategy::ALWAYS).expect("compress");
     let out = decompress(&compressed).expect("decompress");
+    assert_eq!(out, input);
+}
+
+#[test]
+fn roundtrip_via_decompress_with_capacity() {
+    let input = abcd_400();
+    let compressed = compress(&input, &Strategy::ALWAYS).expect("compress");
+    let out = decompress_with_capacity(&compressed, input.len()).expect("decompress");
     assert_eq!(out, input);
 }
 
@@ -63,6 +71,29 @@ fn corrupt_ctrl_only_check() {
 fn ctrl_only_full_decompress_is_empty() {
     let v = decompress(&[0x01]).expect("decompress");
     assert!(v.is_empty());
+}
+
+#[test]
+fn all_literal_control_byte_batches() {
+    let compressed = *b"\x00abcdefgh";
+    assert_eq!(decompress(&compressed).expect("decompress"), b"abcdefgh");
+
+    let mut buf = [0u8; 8];
+    let n = decompress_into(&compressed, &mut buf, true).expect("decompress");
+    assert_eq!(n, buf.len());
+    assert_eq!(&buf, b"abcdefgh");
+}
+
+#[test]
+fn one_byte_offset_match_fills_run() {
+    let compressed = [0x02, b'a', 0x07, 0x01];
+    let expected = vec![b'a'; 11];
+    assert_eq!(decompress(&compressed).expect("decompress"), expected);
+
+    let mut buf = [0u8; 11];
+    let n = decompress_into(&compressed, &mut buf, true).expect("decompress");
+    assert_eq!(n, buf.len());
+    assert_eq!(buf, expected[..]);
 }
 
 // Corrupted: control byte sets tag flag, only 1 byte of the 2-byte tag follows.

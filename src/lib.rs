@@ -9,7 +9,9 @@ mod decompress;
 mod strategy;
 
 pub use compress::{compress, compress_into, max_compressed_buffer_size};
-pub use decompress::{decompress, decompress_into, maximum_compressed_size};
+pub use decompress::{
+    decompress, decompress_into, decompress_with_capacity, maximum_compressed_size,
+};
 pub use strategy::Strategy;
 
 #[cfg(feature = "tokio")]

@@ -4,34 +4,35 @@
 /// as bytes are produced. Returns `None` if the stream is corrupted
 /// (truncated tag, invalid back-reference offset).
 pub fn decompress(source: &[u8]) -> Option<Vec<u8>> {
-    let mut dest: Vec<u8> = Vec::new();
+    decompress_with_capacity(source, 0)
+}
+
+/// Decompress all of `source` into a fresh `Vec` with at least `capacity`
+/// bytes preallocated. Returns `None` if the stream is corrupted.
+pub fn decompress_with_capacity(source: &[u8], capacity: usize) -> Option<Vec<u8>> {
+    let mut dest: Vec<u8> = Vec::with_capacity(capacity);
     let mut sp = 0;
 
     while sp < source.len() {
         let mut ctrl = source[sp];
         sp += 1;
 
-        for _ in 0..8 {
+        for ctrlc in 0..8 {
             if sp >= source.len() {
                 break;
             }
 
             if ctrl & 1 != 0 {
-                let (mut off, mut len) = read_tag(source, &mut sp)?;
+                let (off, len) = read_tag(source, &mut sp)?;
                 if off == 0 || off > dest.len() {
                     return None;
                 }
-                let mut dp = dest.len();
-                dest.resize(dp + len, 0);
-                while off < len {
-                    let s = dp - off;
-                    dest.copy_within(s..s + off, dp);
-                    len -= off;
-                    dp += off;
-                    off += off;
-                }
-                let s = dp - off;
-                dest.copy_within(s..s + len, dp);
+                append_match(&mut dest, off, len);
+            } else if ctrl == 0 {
+                let len = (8 - ctrlc).min(source.len() - sp);
+                dest.extend_from_slice(&source[sp..sp + len]);
+                sp += len;
+                break;
             } else {
                 dest.push(source[sp]);
                 sp += 1;
@@ -57,27 +58,24 @@ pub fn decompress_into(source: &[u8], dest: &mut [u8], check_complete: bool) -> 
         let mut ctrl = source[sp];
         sp += 1;
 
-        for _ in 0..8 {
+        for ctrlc in 0..8 {
             if sp >= source.len() || dp >= dest.len() {
                 break;
             }
 
             if ctrl & 1 != 0 {
-                let (mut off, mut len) = read_tag(source, &mut sp)?;
+                let (off, mut len) = read_tag(source, &mut sp)?;
                 if off == 0 || off > dp {
                     return None;
                 }
                 len = len.min(dest.len() - dp);
-                while off < len {
-                    let s = dp - off;
-                    dest.copy_within(s..s + off, dp);
-                    len -= off;
-                    dp += off;
-                    off += off;
-                }
-                let s = dp - off;
-                dest.copy_within(s..s + len, dp);
+                copy_match(dest, &mut dp, off, len);
+            } else if ctrl == 0 {
+                let len = (8 - ctrlc).min(source.len() - sp).min(dest.len() - dp);
+                dest[dp..dp + len].copy_from_slice(&source[sp..sp + len]);
                 dp += len;
+                sp += len;
+                break;
             } else {
                 dest[dp] = source[sp];
                 dp += 1;
@@ -91,6 +89,46 @@ pub fn decompress_into(source: &[u8], dest: &mut [u8], check_complete: bool) -> 
         return None;
     }
     Some(dp)
+}
+
+#[inline]
+fn append_match(dest: &mut Vec<u8>, mut off: usize, mut len: usize) {
+    if off == 1 {
+        let byte = dest[dest.len() - 1];
+        dest.resize(dest.len() + len, byte);
+        return;
+    }
+
+    dest.reserve(len);
+    while off < len {
+        let s = dest.len() - off;
+        dest.extend_from_within(s..s + off);
+        len -= off;
+        off += off;
+    }
+    let s = dest.len() - off;
+    dest.extend_from_within(s..s + len);
+}
+
+#[inline]
+fn copy_match(dest: &mut [u8], dp: &mut usize, mut off: usize, mut len: usize) {
+    if off == 1 {
+        let byte = dest[*dp - 1];
+        dest[*dp..*dp + len].fill(byte);
+        *dp += len;
+        return;
+    }
+
+    while off < len {
+        let s = *dp - off;
+        dest.copy_within(s..s + off, *dp);
+        len -= off;
+        *dp += off;
+        off += off;
+    }
+    let s = *dp - off;
+    dest.copy_within(s..s + len, *dp);
+    *dp += len;
 }
 
 #[inline]

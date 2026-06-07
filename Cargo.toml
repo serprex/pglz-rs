@@ -1,6 +1,6 @@
 [package]
 name = "pglz"
-version = "0.1.0"
+version = "0.1.1"
 edition = "2024"
 license = "PostgreSQL"
 description = "Port of PostgreSQL's pglz compressor with sync and async APIs"

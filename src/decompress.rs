@@ -112,6 +112,13 @@ fn append_match(dest: &mut Vec<u8>, mut off: usize, mut len: usize) {
 
 #[inline]
 fn copy_match(dest: &mut [u8], dp: &mut usize, mut off: usize, mut len: usize) {
+    // Fixed size copy inlines, overshoot gets overwritten by later output
+    if off >= 18 && len <= 18 && dest.len() - *dp >= 18 {
+        let s = *dp - off;
+        dest.copy_within(s..s + 18, *dp);
+        *dp += len;
+        return;
+    }
     if off == 1 {
         let byte = dest[*dp - 1];
         dest[*dp..*dp + len].fill(byte);

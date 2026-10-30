@@ -6,22 +6,13 @@ const MAX_HISTORY_LISTS: usize = 8192;
 const HISTORY_SIZE: usize = 4096;
 const MAX_MATCH: usize = 273;
 
-#[derive(Clone, Copy, Default)]
-struct HistEntry {
-    next: i16,
-    prev: i16,
-    hindex: u16,
-    pos: u32,
-}
-
-/// Hash table of recent input positions used to find back-references.
-/// Entry 0 is reserved as the invalid sentinel and is freely scribbled on
-/// (matches the C reference's "branch-free" linked-list write trick).
+/// Hash chains of recent input positions used to find back-references.
+/// `prev` is a ring keyed by position; recycled slots are always older than
+/// the max back-reference offset, so chain walks stop before reading them.
+/// Positions are stored biased by `HISTORY_SIZE` so 0 means out of window.
 struct History {
-    start: Vec<i16>,
-    entries: Vec<HistEntry>,
-    next: i16,
-    recycle: bool,
+    head: Vec<u32>,
+    prev: Box<[u32; HISTORY_SIZE]>,
     mask: usize,
 }
 
@@ -35,55 +26,29 @@ impl History {
             _ => MAX_HISTORY_LISTS,
         };
         History {
-            start: vec![0; hashsz],
-            entries: vec![HistEntry::default(); HISTORY_SIZE + 1],
-            next: 1,
-            recycle: false,
+            head: vec![0; hashsz],
+            prev: Box::new([0; HISTORY_SIZE]),
             mask: hashsz - 1,
         }
     }
 
     #[inline]
     fn hash(&self, source: &[u8], i: usize) -> usize {
-        let h = if source.len() - i < 4 {
-            source[i] as usize
-        } else {
-            ((source[i] as usize) << 6)
-                ^ ((source[i + 1] as usize) << 4)
-                ^ ((source[i + 2] as usize) << 2)
-                ^ (source[i + 3] as usize)
+        let h = match source[i..] {
+            [a, b, c, d, ..] => {
+                ((a as usize) << 6) ^ ((b as usize) << 4) ^ ((c as usize) << 2) ^ d as usize
+            }
+            [a, ..] => a as usize,
+            [] => unreachable!(),
         };
         h & self.mask
     }
 
+    #[inline]
     fn add(&mut self, source: &[u8], pos: usize) {
-        let hn = self.next;
         let h = self.hash(source, pos);
-
-        if self.recycle {
-            let HistEntry { prev, next, hindex, .. } = self.entries[hn as usize];
-            if prev == 0 {
-                self.start[hindex as usize] = next;
-            } else {
-                self.entries[prev as usize].next = next;
-            }
-            self.entries[next as usize].prev = prev;
-        }
-
-        let head = self.start[h];
-        let he = &mut self.entries[hn as usize];
-        he.next = head;
-        he.prev = 0;
-        he.hindex = h as u16;
-        he.pos = pos as u32;
-        self.entries[head as usize].prev = hn;
-        self.start[h] = hn;
-
-        self.next += 1;
-        if self.next > HISTORY_SIZE as i16 {
-            self.next = 1;
-            self.recycle = true;
-        }
+        self.prev[pos % HISTORY_SIZE] = self.head[h];
+        self.head[h] = (pos + HISTORY_SIZE) as u32;
     }
 
     fn find_match(
@@ -95,45 +60,53 @@ impl History {
     ) -> Option<(usize, usize)> {
         let mut best_len = 0usize;
         let mut best_off = 0usize;
-        let slen = source.len();
+        let input = &source[input_idx..];
+        let input = &input[..input.len().min(MAX_MATCH)];
 
-        let mut hentno = self.start[self.hash(source, input_idx)];
-        while hentno != 0 {
-            let hent = &self.entries[hentno as usize];
-            let hp = hent.pos as usize;
-            let off = input_idx - hp;
+        let mut biased = self.head[self.hash(source, input_idx)] as usize;
+        loop {
+            let off = input_idx + HISTORY_SIZE - biased;
             if off >= 0x0fff {
                 break;
             }
+            let hp = input_idx - off;
 
-            // Fast-fail when we already have a long best: skip this entry
-            // unless its first `best_len` bytes match en bloc.
-            let skip = best_len >= 16
-                && source[input_idx..input_idx + best_len] != source[hp..hp + best_len];
-            if !skip {
-                let max_compare = (slen - input_idx).min(MAX_MATCH);
-                let thislen = source[input_idx..input_idx + max_compare]
-                    .iter()
-                    .zip(&source[hp..])
-                    .position(|(a, b)| a != b)
-                    .unwrap_or(max_compare);
-                if thislen > best_len {
-                    best_len = thislen;
+            // Skip candidates that can't beat a long best without a full scan
+            if best_len < 16 || input[..best_len] == source[hp..hp + best_len] {
+                let len = match_len(input, &source[hp..]);
+                if len > best_len {
+                    best_len = len;
                     best_off = off;
                 }
             }
 
-            hentno = hent.next;
-            if hentno != 0 {
-                if best_len >= good_match {
-                    break;
-                }
-                good_match -= (good_match * good_drop) / 100;
+            if best_len >= good_match {
+                break;
             }
+            good_match -= (good_match * good_drop) / 100;
+            biased = self.prev[hp % HISTORY_SIZE] as usize;
         }
 
         (best_len > 2).then_some((best_len, best_off))
     }
+}
+
+/// Length of common prefix of `a` and `b`, capped at `a.len()`
+#[inline]
+fn match_len(a: &[u8], b: &[u8]) -> usize {
+    let (a8, _) = a.as_chunks::<8>();
+    for (i, (x, y)) in a8.iter().zip(b.as_chunks::<8>().0).enumerate() {
+        let diff = u64::from_le_bytes(*x) ^ u64::from_le_bytes(*y);
+        if diff != 0 {
+            return i * 8 + (diff.trailing_zeros() / 8) as usize;
+        }
+    }
+    let done = a8.len() * 8;
+    done + a[done..]
+        .iter()
+        .zip(&b[done..])
+        .take_while(|(x, y)| x == y)
+        .count()
 }
 
 /// Output cursor maintaining the rolling 8-bit control byte described in the
@@ -141,57 +114,46 @@ impl History {
 struct Output<'a> {
     dest: &'a mut [u8],
     bp: usize,
-    ctrlp: Option<usize>,
-    ctrlb: u8,
-    ctrl: u32,
+    ctrlp: usize,
+    ctrl: u8,
 }
 
 impl<'a> Output<'a> {
     fn new(dest: &'a mut [u8]) -> Self {
-        Output { dest, bp: 0, ctrlp: None, ctrlb: 0, ctrl: 0 }
+        Output { dest, bp: 0, ctrlp: 0, ctrl: 0 }
     }
 
     #[inline]
-    fn step_ctrl(&mut self) {
-        if self.ctrl & 0xff == 0 {
-            if let Some(idx) = self.ctrlp {
-                self.dest[idx] = self.ctrlb;
-            }
-            self.ctrlp = Some(self.bp);
+    fn step_ctrl(&mut self, is_tag: bool) {
+        if self.ctrl == 0 {
+            self.ctrlp = self.bp;
+            self.dest[self.bp] = 0;
             self.bp += 1;
-            self.ctrlb = 0;
             self.ctrl = 1;
         }
+        if is_tag {
+            self.dest[self.ctrlp] |= self.ctrl;
+        }
+        self.ctrl <<= 1;
     }
 
     fn emit_literal(&mut self, byte: u8) {
-        self.step_ctrl();
+        self.step_ctrl(false);
         self.dest[self.bp] = byte;
         self.bp += 1;
-        self.ctrl <<= 1;
     }
 
     fn emit_tag(&mut self, len: usize, off: usize) {
-        self.step_ctrl();
-        self.ctrlb |= self.ctrl as u8;
-        self.ctrl <<= 1;
+        self.step_ctrl(true);
+        let hi = ((off & 0xf00) >> 4) as u8;
+        let lo = off as u8;
         if len > 17 {
-            self.dest[self.bp] = (((off & 0xf00) >> 4) | 0x0f) as u8;
-            self.dest[self.bp + 1] = (off & 0xff) as u8;
-            self.dest[self.bp + 2] = (len - 18) as u8;
+            self.dest[self.bp..self.bp + 3].copy_from_slice(&[hi | 0x0f, lo, (len - 18) as u8]);
             self.bp += 3;
         } else {
-            self.dest[self.bp] = (((off & 0xf00) >> 4) | (len - 3)) as u8;
-            self.dest[self.bp + 1] = (off & 0xff) as u8;
+            self.dest[self.bp..self.bp + 2].copy_from_slice(&[hi | (len - 3) as u8, lo]);
             self.bp += 2;
         }
-    }
-
-    fn finish(self) -> usize {
-        if let Some(idx) = self.ctrlp {
-            self.dest[idx] = self.ctrlb;
-        }
-        self.bp
     }
 }
 
@@ -250,10 +212,10 @@ pub fn compress_into(source: &[u8], dest: &mut [u8], strategy: &Strategy) -> Opt
 
         if let Some((len, off)) = history.find_match(source, dp, good_match, good_drop) {
             out.emit_tag(len, off);
-            for _ in 0..len {
-                history.add(source, dp);
-                dp += 1;
+            for pos in dp..dp + len {
+                history.add(source, pos);
             }
+            dp += len;
             found_match = true;
         } else {
             out.emit_literal(source[dp]);
@@ -262,9 +224,5 @@ pub fn compress_into(source: &[u8], dest: &mut [u8], strategy: &Strategy) -> Opt
         }
     }
 
-    let n = out.finish();
-    if n >= result_max {
-        return None;
-    }
-    Some(n)
+    (out.bp < result_max).then_some(out.bp)
 }
